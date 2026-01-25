@@ -1,0 +1,5 @@
+mido>=1.3.0
+# On Linux, mido needs a backend: pip install python-rtmidi (and: apt install libasound2-dev)
+# or use PortMidi: apt install libportmidi-dev and MIDO_BACKEND=mido.backends.portmidi
+
+astropy>=5.0
