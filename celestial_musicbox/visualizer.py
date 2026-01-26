@@ -21,8 +21,8 @@ SPECTRAL_SYMBOLS = {
 DEFAULT_SYMBOL = "\u2022"  # •
 
 NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-# One chord: [spectral, magnitude]; velocity = distance
-CHORD_LABELS = ["spec", "mag"]
+# One chord: [color (B-V), distance]; velocity = magnitude
+CHORD_LABELS = ["color", "dist"]
 
 
 def spectral_to_symbol(spectral: Optional[str]) -> str:
@@ -55,7 +55,7 @@ def _format_dyads(dyads: list[tuple[int, int]]) -> str:
         label = CHORD_LABELS[i] if i < len(CHORD_LABELS) else ""
         parts.append(f"{label}: {midi_note_to_name(n)}")
     vel = dyads[0][1] if dyads else 0
-    return "  ".join(parts) + f"  @{vel} (vel=dist)"
+    return "  ".join(parts) + f"  @{vel} (vel=mag)"
 
 
 def _prop_line(rec: dict) -> str:
@@ -72,6 +72,13 @@ def _prop_line(rec: dict) -> str:
     if d is not None:
         bits.append(f"dist {d} ly")
     return "  ".join(bits)
+
+
+def _shortest_arc_deg(a_deg: float, b_deg: float) -> float:
+    """Shortest angular distance |a - b| in [0, 180] degrees. Preserves precision."""
+    a, b = float(a_deg), float(b_deg)
+    d = (a - b + 180.0) % 360.0 - 180.0
+    return abs(d)
 
 
 def _coord_line(rec: dict) -> tuple[str, str]:
@@ -93,8 +100,7 @@ def _coord_line(rec: dict) -> tuple[str, str]:
     # Warn if RA and LST differ by >1h (15°) at transit — e.g. 12h bug from lon or clock
     warning = ""
     if ra is not None and lst is not None:
-        d = abs(float(ra) - float(lst)) % 360.0
-        short_deg = min(d, 360.0 - d)
+        short_deg = _shortest_arc_deg(ra, lst)
         if short_deg > 15.0:
             diff_h = short_deg / 15.0
             warning = f"  \u2502  \u26a0 RA and LST differ by {diff_h:.1f}h \u2014 check --lon (East positive, e.g. -120 for 120\u00b0W) and system clock\n"

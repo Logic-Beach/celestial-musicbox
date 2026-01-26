@@ -1,14 +1,16 @@
 """
-Meridian transit scheduler: computes LST = RA and fires at transit times.
+Meridian transit scheduler.
 
-Uses a precomputed star catalog (ra_deg, dec_deg, ...) and the observer's lon/lat
-to compute when each star crosses the meridian (LST = RA). Fires at those times.
+Stars transit when LST = RA. We poll until we observe that, then fire (MIDI, optionally Stellarium).
 """
+
+from __future__ import annotations
 
 import heapq
 import itertools
 import json
 import math
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -16,61 +18,110 @@ from typing import Optional
 from astropy import units as u
 from astropy.time import Time
 
+from . import visualizer as viz
 from .midi_sender import open_mido_output, send_dyads
-
-# Minimum seconds between stars when we're "catching up" (transit was in the past)
-_CATCH_UP_SPACING = 2.0
 from .stellarium_client import slew_to
 from .star_to_midi import star_to_dyads
-from . import visualizer as viz
 
-# Fallback sidereal day in UT seconds (mean) if we can't derive rate from astropy
-_SIDEREAL_DAY_UTC = 86164.0905
+SIDEREAL_DAY_S = 86164.0905
+LST_RATE_DEG_S = 360.0 / SIDEREAL_DAY_S
+AT_TRANSIT_DEG = 0.01  # fire when |LST - RA| <= this (36 arcsec)
+
+
+def _unix() -> float:
+    return time.time()
+
+
+def _time(t: float) -> Time:
+    return Time(t, format="unix")
+
+
+def _norm_360(x: float) -> float:
+    """Angle in [0, 360). Clamp 360.0 -> 0.0 if float rounding produces it."""
+    v = float(x) % 360.0
+    return 0.0 if v >= 360.0 else v
 
 
 def _lst_deg(t: Time, lon_deg: float) -> float:
-    """Local sidereal time in degrees [0, 360). Longitude: East positive (e.g. -120 for 120°W).
-
-    Uses UT1 when IERS is available so LST follows Earth rotation; falls back to t as-is (UTC)
-    if UT1 conversion fails (e.g. no IERS). Stellarium and system clock should both be in sync
-    with real UT for best accuracy.
-    """
+    """Local sidereal time in degrees [0, 360). East positive. Uses UT1 when IERS available."""
     try:
         t_use = t.ut1
     except Exception:
         t_use = t
     h = t_use.sidereal_time("apparent", longitude=lon_deg * u.deg).hour
-    return (h * 15.0) % 360.0
+    return _norm_360(h * 15.0)
 
 
-def _lst_rate_deg_per_sec(t: Time, lon_deg: float) -> float:
-    """Rate of change of LST (deg/s) at time t, from astropy's apparent sidereal time."""
-    lst0 = _lst_deg(t, lon_deg)
-    lst1 = _lst_deg(t + 1.0 * u.s, lon_deg)
-    d = lst1 - lst0
-    if d < 0:
-        d += 360.0
-    return d
+def _diff_deg(lst: float, ra: float) -> float:
+    """Shortest angular distance |LST - RA| in [0, 180] degrees."""
+    d = (lst - ra + 180.0) % 360.0 - 180.0
+    return abs(d)
 
 
-def next_transit_utc(ra_deg: float, lon_deg: float, after: Time) -> Time:
-    """Next UTC time when LST = RA (mod 360) at or after `after`."""
-    lst = _lst_deg(after, lon_deg)
-    wait_deg = (ra_deg - lst + 360.0) % 360.0
-    if wait_deg < 0.05:
-        wait_deg = 0.0  # at transit now; fire immediately (was 360, which pushed it 24h)
-    rate = _lst_rate_deg_per_sec(after, lon_deg)
-    if rate < 1e-9:
-        rate = 360.0 / _SIDEREAL_DAY_UTC
-    wait_sec = wait_deg / rate
-    return after + (wait_sec * u.s)
+def _wait_deg(lst: float, ra: float) -> float:
+    """Degrees LST must advance to reach RA. In [0, 360). >= 180 means past meridian."""
+    return _norm_360(ra - lst + 360.0)
 
 
-def altitude_at_transit_deg(dec_deg: float, lat_deg: float) -> float:
-    """Altitude (degrees) when star is on the meridian: sin(alt)=cos(dec-lat)."""
+def _lst_rate_deg_per_sec(unix: float, lon_deg: float) -> float:
+    """LST rate (deg/s) at unix, from astropy. Fallback: fixed sidereal rate."""
+    try:
+        t0 = _time(unix)
+        t1 = _time(unix + 1.0)
+        lst0 = _lst_deg(t0, lon_deg)
+        lst1 = _lst_deg(t1, lon_deg)
+        d = _norm_360(lst1 - lst0 + 360.0)
+        if 1e-9 < d < 360.0 - 1e-9:
+            return d
+    except Exception:
+        pass
+    return LST_RATE_DEG_S
+
+
+def _next_transit_unix(ra_deg: float, lon_deg: float, after_unix: float, *, skip_immediate: bool = False) -> float:
+    """Unix time of next transit (LST = RA) at or after after_unix."""
+    t = _time(after_unix)
+    lst = _lst_deg(t, lon_deg)
+    w = _wait_deg(lst, ra_deg)
+    if w < AT_TRANSIT_DEG:
+        if skip_immediate:
+            w = 360.0
+        else:
+            return after_unix
+    rate = _lst_rate_deg_per_sec(after_unix, lon_deg)
+    return after_unix + w / rate
+
+
+def _altitude_at_transit(dec_deg: float, lat_deg: float) -> float:
     x = math.radians(dec_deg - lat_deg)
-    cos_x = max(-1.0, min(1.0, math.cos(x)))
-    return math.degrees(math.asin(cos_x))
+    return math.degrees(math.asin(max(-1.0, min(1.0, math.cos(x)))))
+
+
+def _star_rec(star: dict, ra_scale: float, lat_deg: float) -> dict:
+    ra = float(star["ra_deg"]) * ra_scale
+    dec = float(star["dec_deg"])
+    rec = {"name": star["name"], "vmag": star.get("vmag", 5.0), "ra_deg": ra, "dec_deg": dec}
+    if star.get("spectral"):
+        rec["spectral"] = star["spectral"]
+    if star.get("mass") is not None:
+        rec["mass"] = star["mass"]
+    else:
+        rec["altitude"] = _altitude_at_transit(dec, lat_deg)
+    rec["distance_ly"] = star.get("distance_ly") or star.get("distance")
+    if star.get("bv") is not None:
+        rec["bv"] = star["bv"]
+    return rec
+
+
+def _stellarium_candidates(rec: dict, star: dict) -> list[str]:
+    out = [rec["name"]]
+    for k, fmt in [("hip", "HIP {}"), ("hd", "HD {}"), ("hr", "HR {}")]:
+        v = star.get(k)
+        if v is not None:
+            s = fmt.format(v)
+            if s not in out:
+                out.append(s)
+    return out
 
 
 def run_scheduler(
@@ -92,9 +143,8 @@ def run_scheduler(
 
     raw = json.loads(catalog_path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
-        raise SystemExit("star_catalog.json must be a JSON array of star objects.")
+        raise SystemExit("star_catalog.json must be a JSON array.")
 
-    # Filter: dec such that star can be above horizon at transit (alt > 0 => |dec-lat| < 90)
     lo, hi = lat_deg - 90.0, lat_deg + 90.0
     stars = [
         s
@@ -106,87 +156,104 @@ def run_scheduler(
         and lo <= float(s["dec_deg"]) <= hi
     ]
 
-    # HYG and our build output ra_deg in degrees (0–360). Old catalogs may have ra in HOURS (0–24).
-    # If max ra_deg <= 24, assume hours and scale so LST=RA math is correct.
     ras = [float(s["ra_deg"]) for s in stars]
     ra_scale = 15.0 if (ras and max(ras) <= 24.0) else 1.0
     if ra_scale != 1.0:
-        import sys as _sys
-        print("Note: catalog ra_deg looks like hours (0–24); converting to degrees. Rebuild with build_star_catalog.py for correct ra_deg.\n", file=_sys.stderr)
+        print("Note: catalog ra_deg in hours; converting to degrees.\n", file=sys.stderr)
 
-    # Build heap using now taken immediately before the loop (so LST matches).
-    now = Time.now()
-    lst_deg = _lst_deg(now, lon_deg)
+    now = _unix()
     tie = itertools.count()
     heap: list[tuple[float, int, dict]] = []
-    # Each star: next_transit_utc(ra, lon, now). Min‑heap by t_unix → soonest transit.
     for s in stars:
         ra = float(s["ra_deg"]) * ra_scale
-        t = next_transit_utc(ra, lon_deg, now)
-        heapq.heappush(heap, (t.to_value("unix"), next(tie), s))
+        t = _next_transit_unix(ra, lon_deg, now, skip_immediate=False)
+        heapq.heappush(heap, (t, next(tie), s))
 
     port = open_mido_output(midi_port_name)
 
     if not quiet and heap:
         t0, _, s0 = heap[0]
-        d = max(0.0, t0 - time.time())
+        d = max(0.0, t0 - _unix())
         h, r = int(d) // 3600, int(d) % 3600
-        m, s = r // 60, r % 60
+        m, sec = r // 60, r % 60
         ra0 = float(s0["ra_deg"]) * ra_scale
-        msg = f"Scheduled {len(stars)} stars. Next transit: {s0['name']} in {h}:{m:02d}:{s:02d} (soonest of all).\n"
-        # If >30 min, show LST and star RA so user can sanity‑check (e.g. at 22h LST, next should be RA≈22h, not 0h).
+        lst0 = _lst_deg(_time(now), lon_deg)
+        msg = f"Scheduled {len(stars)} stars. Next: {s0['name']} in {h}:{m:02d}:{sec:02d}\n"
         if d > 1800:
-            msg += f"  (LST≈{lst_deg/15:.1f}h, this star RA≈{ra0/15:.1f}h — if your meridian is at 22h, stars near 22h RA should come first; check --lon/--lat and that catalog has ra_deg in degrees)\n"
+            msg += f"  LST≈{lst0/15:.1f}h  next star RA≈{ra0/15:.1f}h\n"
         print(msg, flush=True)
 
     while True:
         t_unix, _, star = heapq.heappop(heap)
-        now_unix = time.time()
-        wait = t_unix - now_unix
-
-        # Build dict for star_to_dyads and visualizer: name, vmag, spectral?, mass?, altitude?, distance-ly?, ra_deg, dec_deg
         ra = float(star["ra_deg"]) * ra_scale
-        dec = float(star["dec_deg"])
-        rec = {
-            "name": star["name"],
-            "vmag": star.get("vmag", 5.0),
-            "ra_deg": ra,
-            "dec_deg": dec,
-        }
-        if star.get("spectral"):
-            rec["spectral"] = star["spectral"]
-        if star.get("mass") is not None:
-            rec["mass"] = star["mass"]
-        else:
-            rec["altitude"] = altitude_at_transit_deg(dec, lat_deg)
-        if star.get("distance_ly") is not None:
-            rec["distance_ly"] = star["distance_ly"]
-        elif star.get("distance") is not None:
-            rec["distance_ly"] = star["distance"]
-
+        rec = _star_rec(star, ra_scale, lat_deg)
         dyads = star_to_dyads(rec, supplement)
 
-        if wait < 0:
-            time.sleep(_CATCH_UP_SPACING)  # min spacing when catching up (avoids rapid-fire)
+        # Wait until the star has *crossed* the meridian (LST > RA). We only fire/slew
+        # when we observe that crossing, not when we're still approaching.
+        skipped = False
+        waiting = False
+        while True:
+            u = _unix()
+            lst = _lst_deg(_time(u), lon_deg)
+            wait_d = _wait_deg(lst, ra)
 
+            if wait_d >= 180.0:
+                if not waiting:
+                    t_next = _next_transit_unix(ra, lon_deg, u, skip_immediate=True)
+                    heapq.heappush(heap, (t_next, next(tie), star))
+                    skipped = True
+                    break
+                if wait_d <= 180.0:
+                    t_next = _next_transit_unix(ra, lon_deg, u, skip_immediate=True)
+                    heapq.heappush(heap, (t_next, next(tie), star))
+                    skipped = True
+                    break
+                break
+            waiting = True
+
+            rate = _lst_rate_deg_per_sec(u, lon_deg)
+            wait_s = wait_d / rate
+            if wait_s > 600.0:
+                t_next = _next_transit_unix(ra, lon_deg, u, skip_immediate=True)
+                heapq.heappush(heap, (t_next, next(tie), star))
+                skipped = True
+                break
+
+            chunk = min(0.5, max(0.05, wait_s))
+            if not quiet and sys.stdout.isatty():
+                print(viz.format_next(star["name"], wait_s), end="\r", flush=True)
+            time.sleep(chunk)
+
+        if skipped:
+            continue
+        if not quiet and sys.stdout.isatty():
+            print(" " * 60, end="\r", flush=True)
+
+        u_now = _unix()
+        lst_now = _lst_deg(_time(u_now), lon_deg)
+        rec["lst_deg"] = lst_now
+        diff_deg = _diff_deg(lst_now, ra)
+        if diff_deg > 1.0:
+            sys.stderr.write(
+                f"Transit skip: |LST−RA| = {diff_deg:.3f}° for {star['name']} — too far off meridian, rescheduling\n"
+            )
+            t_next = _next_transit_unix(ra, lon_deg, u_now, skip_immediate=True)
+            heapq.heappush(heap, (t_next, next(tie), star))
+            continue
         if not quiet:
-            if wait > 0:
-                viz.countdown(wait, star["name"])  # wait for this transit
-            # Current LST at display time for sanity-check (RA and LST in h should match at transit).
-            rec["lst_deg"] = _lst_deg(Time(time.time(), format="unix"), lon_deg)
-            # Upcoming = next 2 soonest with future transit times; skip past/"now" so we show real countdowns.
-            now_t = time.time()
-            upcoming = [(s["name"], t - now_t) for (t, _, s) in heapq.nsmallest(50, heap) if t > now_t][:2]
+            upcoming = [(s["name"], t - u_now) for t, _, s in heapq.nsmallest(50, heap) if t > u_now][:2]
             viz.print_transit(rec, dyads, upcoming=upcoming)
-        elif wait > 0:
-            time.sleep(wait)
 
         if stellarium_url:
-            slew_to(rec["ra_deg"], rec["dec_deg"], base_url=stellarium_url, target=rec["name"])
+            slew_to(
+                rec["ra_deg"],
+                rec["dec_deg"],
+                base_url=stellarium_url,
+                target_candidates=_stellarium_candidates(rec, star),
+            )
 
         send_dyads(port, dyads, note_duration=note_duration)
 
-        # Schedule next transit for this star (~24h later)
-        ra = float(star["ra_deg"]) * ra_scale
-        t_next = next_transit_utc(ra, lon_deg, Time(t_unix, format="unix") + (1.0 * u.s))
-        heapq.heappush(heap, (t_next.to_value("unix"), next(tie), star))
+        t_next = _next_transit_unix(ra, lon_deg, _unix() + SIDEREAL_DAY_S, skip_immediate=True)
+        heapq.heappush(heap, (t_next, next(tie), star))

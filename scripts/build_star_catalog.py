@@ -117,7 +117,8 @@ def build_from_hyg(
             dec = _parse_float(row.get("dec"))
             if ra_h is None or dec is None:
                 continue
-            # HYG ra is in hours (0-24). Convert to degrees for ra_deg.
+            # HYG ra is in hours (0-24). Convert to degrees for ra_deg. No rounding;
+            # keep full float precision for transit timing.
             ra = ra_h * 15.0
             # Only stars that can ever be above the horizon at this latitude.
             # dec in [lat-90, lat+90]; at 36°N that's dec >= -54°.
@@ -130,17 +131,32 @@ def build_from_hyg(
                 "dec_deg": dec,
                 "vmag": mag if mag is not None else 5.0,
             }
+            hip = _parse_float(row.get("hip"))
+            if hip is not None and hip > 0:
+                rec["hip"] = int(hip)
+            hd = _parse_float(row.get("hd"))
+            if hd is not None and hd > 0:
+                rec["hd"] = int(hd)
+            hr = _parse_float(row.get("hr"))
+            if hr is not None and hr > 0:
+                rec["hr"] = int(hr)
             dist_pc = _parse_float(row.get("dist"))
             if dist_pc is not None and dist_pc > 0:
                 rec["distance_ly"] = round(dist_pc * PC_TO_LY, 2)
+            # B-V color index (HYG "ci"); used for MIDI pitch1
+            ci = _parse_float(row.get("ci")) or _parse_float(row.get("bv"))
+            if ci is not None:
+                rec["bv"] = round(ci, 3)
             sp = (row.get("spect") or "").strip()
             if sp:
                 rec["spectral"] = sp
-            # Merge supplement for mass (and overwrite spectral/distance if we want; supplement usually better for named)
+            # Merge supplement for mass, bv, spectral, distance
             sup = supplement.get(name, {})
             if isinstance(sup, dict):
                 if sup.get("mass") is not None:
                     rec["mass"] = sup["mass"]
+                if sup.get("bv") is not None:
+                    rec["bv"] = sup["bv"]
                 if sup.get("spectral") is not None and not rec.get("spectral"):
                     rec["spectral"] = sup["spectral"]
                 if sup.get("distance_ly") is not None:
