@@ -17,8 +17,8 @@ def main() -> None:
         default=root / "data" / "star_catalog.json",
         help="Path to star_catalog.json (default: data/star_catalog.json).",
     )
-    ap.add_argument("--lon", type=float, default=None, help="Observer longitude (degrees, East positive). E.g. -120 for 120°W.")
-    ap.add_argument("--lat", type=float, default=None, help="Observer latitude (degrees).")
+    ap.add_argument("--lon", type=float, default=None, help="Observer longitude (degrees, East positive). Full precision kept (e.g. -86.808250).")
+    ap.add_argument("--lat", type=float, default=None, help="Observer latitude (degrees). Full precision kept.")
     ap.add_argument(
         "--supplement",
         type=Path,
@@ -58,6 +58,12 @@ def main() -> None:
         default=None,
         help="Seconds the chord (both notes) rings per star (default 0.6).",
     )
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Debug logging to stderr (catalog, heap, wait, fire, Stellarium, MIDI).",
+    )
     args = ap.parse_args()
 
     if args.list_ports:
@@ -81,6 +87,7 @@ def main() -> None:
         quiet=args.quiet,
         stellarium_url=stellarium_url,
         note_duration=args.note_duration,
+        verbose=args.verbose,
     )
 
 

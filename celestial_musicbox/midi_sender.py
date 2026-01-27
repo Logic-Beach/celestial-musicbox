@@ -2,6 +2,7 @@
 Send MIDI dyads (note_on/note_off pairs) to an external synth.
 """
 
+import sys
 import time
 from typing import Optional
 
@@ -38,7 +39,7 @@ def get_mido_output_names() -> list[str]:
         raise
 
 
-def open_mido_output(port_name: Optional[str] = None):
+def open_mido_output(port_name: Optional[str] = None, verbose: bool = False):
     """Open MIDI output. If port_name given, substring-match; else first port."""
     names = get_mido_output_names()
     if not names:
@@ -46,8 +47,12 @@ def open_mido_output(port_name: Optional[str] = None):
     if port_name:
         cand = [n for n in names if port_name.lower() in n.lower()]
         name = cand[0] if cand else names[0]
+        if verbose:
+            print(f"[midi] matching {port_name!r} → {name}", file=sys.stderr, flush=True)
     else:
         name = names[0]
+        if verbose:
+            print(f"[midi] using first port: {name}", file=sys.stderr, flush=True)
     return mido.open_output(name)
 
 
@@ -56,9 +61,13 @@ def send_dyads(
     dyads: list[tuple[int, int]],
     *,
     note_duration: Optional[float] = None,
+    verbose: bool = False,
 ) -> None:
     """Play all notes as one simultaneous chord: note_on each, hold, note_off each."""
     nd = note_duration if note_duration is not None else NOTE_DURATION
+    if verbose:
+        parts = [f"n{n}@v{v}" for n, v in dyads]
+        print(f"[midi] send_dyads {parts} dur={nd}s", file=sys.stderr, flush=True)
     for note, vel in dyads:
         port.send(Message("note_on", note=note, velocity=vel))
     time.sleep(nd)

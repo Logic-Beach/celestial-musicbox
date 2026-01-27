@@ -3,7 +3,16 @@ Tests for transit detection: _wait_deg, _lst_deg, crossing logic, fire-time sani
 
 Run: python -m pytest tests/ -v
 Or:  python -m unittest tests.test_transit_logic -v
+Or:  python tests/test_transit_logic.py  (from project root)
 """
+
+import sys
+from pathlib import Path
+
+# Allow running as python tests/test_transit_logic.py (project root not on path)
+_root = Path(__file__).resolve().parent.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
 
 import unittest
 
@@ -17,9 +26,11 @@ from celestial_musicbox.transit_scheduler import (
     _wait_deg,
     _lst_rate_deg_per_sec,
     _next_transit_unix,
+    _stars_just_crossed,
     _time,
     SIDEREAL_DAY_S,
     LST_RATE_DEG_S,
+    JUST_CROSSED_DEG,
 )
 
 
@@ -139,50 +150,33 @@ class TestFireTimeVerification(unittest.TestCase):
         self.assertAlmostEqual(_diff_deg(lst, ra), 180.0)
 
 
-class TestSimulatedWaitLoop(unittest.TestCase):
-    """
-    Simulate the wait-loop logic with a fake time stream that crosses transit.
-    Assert we fire exactly once, when just past, with |LST-RA| < 1°.
-    """
+class TestStarsJustCrossed(unittest.TestCase):
+    """Poll-based 'just crossed' search: only stars with wait_d > 180 and >= 360 - JUST_CROSSED_DEG."""
 
-    def test_fire_once_when_crossing(self):
-        lon_deg = -87.0
-        base = 1700000000.0
-        lst0 = _lst_deg(_time(base), lon_deg)
-        ra = lst0
-        rate = _lst_rate_deg_per_sec(base, lon_deg)
-        self.assertGreater(rate, 1e-6)
+    def test_just_crossed_returns_star_within_window(self):
+        stars = [
+            {"name": "A", "ra_deg": 100.0, "dec_deg": 0.0},
+            {"name": "B", "ra_deg": 200.0, "dec_deg": 0.0},
+        ]
+        lst = 100.01  # 0.01° past A's meridian
+        cooldown: dict[str, float] = {}
+        got = _stars_just_crossed(stars, 1.0, lst, cooldown, 0.0)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][0]["name"], "A")
+        self.assertLess(got[0][1], 0.1)
 
-        fired = []
-        waiting = False
-        skipped = False
-        dt = 0.05
-        n = 80
-        for i in range(n):
-            u = base + i * dt
-            lst = _lst_deg(_time(u), lon_deg)
-            wait_d = _wait_deg(lst, ra)
-            if wait_d >= 180.0:
-                if not waiting:
-                    skipped = True
-                    break
-                if wait_d <= 180.0:
-                    skipped = True
-                    break
-                fired.append((u, lst, wait_d, _diff_deg(lst, ra)))
-                break
-            waiting = True
-            wait_s = wait_d / rate
-            if wait_s > 600.0:
-                skipped = True
-                break
+    def test_before_meridian_not_returned(self):
+        stars = [{"name": "A", "ra_deg": 100.0, "dec_deg": 0.0}]
+        lst = 99.9  # 0.1° before A
+        got = _stars_just_crossed(stars, 1.0, lst, {}, 0.0)
+        self.assertEqual(len(got), 0)
 
-        self.assertFalse(skipped, "should not skip when crossing")
-        self.assertEqual(len(fired), 1, "should fire exactly once")
-        u_fire, lst_fire, w_fire, diff_fire = fired[0]
-        self.assertGreater(w_fire, 180.0)
-        self.assertLess(diff_fire, 1.0, f"|LST-RA| at fire should be < 1°, got {diff_fire}")
-
+    def test_cooldown_excludes_star(self):
+        stars = [{"name": "A", "ra_deg": 100.0, "dec_deg": 0.0}]
+        lst = 100.01
+        cooldown = {"A": 0.0}  # just fired
+        got = _stars_just_crossed(stars, 1.0, lst, cooldown, 1.0)  # 1s later, still on cooldown
+        self.assertEqual(len(got), 0)
 
 if __name__ == "__main__":
     unittest.main()

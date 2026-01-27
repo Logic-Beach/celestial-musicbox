@@ -1,13 +1,15 @@
 """
-Meridian transit scheduler.
+Meridian transit trigger: poll-based "who's at meridian now?".
 
-Stars transit when LST = RA. We poll until we observe that, then fire (MIDI, optionally Stellarium).
+No heap scheduling. Every POLL_INTERVAL we get LST (from Stellarium if enabled, else
+--lon + system time), search the catalog for stars that just crossed (wait_d in (180°, 180°+ε)),
+pick the closest, fire (MIDI / Stellarium), cooldown that star for ~1 sidereal day. Repeat.
+
+Using Stellarium's time and location when enabled keeps us aligned with Stellarium's sky.
 """
 
 from __future__ import annotations
 
-import heapq
-import itertools
 import json
 import math
 import sys
@@ -20,12 +22,15 @@ from astropy.time import Time
 
 from . import visualizer as viz
 from .midi_sender import open_mido_output, send_dyads
-from .stellarium_client import slew_to
+from .stellarium_client import slew_to, _get_status as get_status
 from .star_to_midi import star_to_dyads
 
 SIDEREAL_DAY_S = 86164.0905
 LST_RATE_DEG_S = 360.0 / SIDEREAL_DAY_S
-AT_TRANSIT_DEG = 0.01  # fire when |LST - RA| <= this (36 arcsec)
+POLL_INTERVAL_S = 0.5
+# Only consider stars that crossed in the last JUST_CROSSED_DEG (e.g. ~2 min of arc).
+JUST_CROSSED_DEG = 0.5
+COOLDOWN_FRAC = 0.98  # don't re-fire same star until 98% of sidereal day has passed
 
 
 def _unix() -> float:
@@ -37,13 +42,11 @@ def _time(t: float) -> Time:
 
 
 def _norm_360(x: float) -> float:
-    """Angle in [0, 360). Clamp 360.0 -> 0.0 if float rounding produces it."""
     v = float(x) % 360.0
     return 0.0 if v >= 360.0 else v
 
 
 def _lst_deg(t: Time, lon_deg: float) -> float:
-    """Local sidereal time in degrees [0, 360). East positive. Uses UT1 when IERS available."""
     try:
         t_use = t.ut1
     except Exception:
@@ -52,19 +55,22 @@ def _lst_deg(t: Time, lon_deg: float) -> float:
     return _norm_360(h * 15.0)
 
 
+def _lst_from_jd(jd: float, lon_deg: float) -> float:
+    """LST in degrees from Julian day and longitude."""
+    t = Time(jd, format="jd")
+    return _lst_deg(t, lon_deg)
+
+
 def _diff_deg(lst: float, ra: float) -> float:
-    """Shortest angular distance |LST - RA| in [0, 180] degrees."""
     d = (lst - ra + 180.0) % 360.0 - 180.0
     return abs(d)
 
 
 def _wait_deg(lst: float, ra: float) -> float:
-    """Degrees LST must advance to reach RA. In [0, 360). >= 180 means past meridian."""
     return _norm_360(ra - lst + 360.0)
 
 
 def _lst_rate_deg_per_sec(unix: float, lon_deg: float) -> float:
-    """LST rate (deg/s) at unix, from astropy. Fallback: fixed sidereal rate."""
     try:
         t0 = _time(unix)
         t1 = _time(unix + 1.0)
@@ -79,11 +85,11 @@ def _lst_rate_deg_per_sec(unix: float, lon_deg: float) -> float:
 
 
 def _next_transit_unix(ra_deg: float, lon_deg: float, after_unix: float, *, skip_immediate: bool = False) -> float:
-    """Unix time of next transit (LST = RA) at or after after_unix."""
+    """Unix time of next transit (LST = RA) at or after after_unix. Kept for tests / upcoming."""
     t = _time(after_unix)
     lst = _lst_deg(t, lon_deg)
     w = _wait_deg(lst, ra_deg)
-    if w < AT_TRANSIT_DEG:
+    if w < 0.01:
         if skip_immediate:
             w = 360.0
         else:
@@ -113,14 +119,105 @@ def _star_rec(star: dict, ra_scale: float, lat_deg: float) -> dict:
     return rec
 
 
+def _normalize_name(s: str) -> str:
+    if not s or not isinstance(s, str):
+        return ""
+    return " ".join(str(s).split())
+
+
 def _stellarium_candidates(rec: dict, star: dict) -> list[str]:
-    out = [rec["name"]]
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(c: str) -> None:
+        if not c or c in seen:
+            return
+        seen.add(c)
+        out.append(c)
+
     for k, fmt in [("hip", "HIP {}"), ("hd", "HD {}"), ("hr", "HR {}")]:
         v = star.get(k)
         if v is not None:
-            s = fmt.format(v)
-            if s not in out:
-                out.append(s)
+            add(fmt.format(v))
+    name = rec.get("name")
+    if name:
+        add(_normalize_name(name))
+    return out
+
+
+def _log(msg: str, verbose: bool) -> None:
+    if verbose:
+        print(f"[cmb] {msg}", file=sys.stderr, flush=True)
+
+
+def _get_lst_and_lon(
+    stellarium_url: Optional[str],
+    lon_deg: float,
+    verbose: bool,
+) -> tuple[float, float]:
+    """Return (lst_deg, lon_deg). Always use caller's lon_deg (full precision).
+    When stellarium_url set, use Stellarium's time (jday) only; never overwrite lon.
+    """
+    if stellarium_url:
+        st = get_status(stellarium_url)
+        if st:
+            tinfo = st.get("time")
+            if isinstance(tinfo, dict):
+                jd = tinfo.get("jday")
+                if jd is not None:
+                    try:
+                        lst = _lst_from_jd(float(jd), lon_deg)
+                        _log(f"LST from Stellarium jd={jd} lon={lon_deg:.8f}° → lst={lst:.8f}°", verbose)
+                        return (lst, lon_deg)
+                    except (TypeError, ValueError):
+                        pass
+            _log("Stellarium status missing jday; using --lon and system time", verbose)
+    lst = _lst_deg(_time(_unix()), lon_deg)
+    return (lst, lon_deg)
+
+
+def _stars_just_crossed(
+    stars: list[dict],
+    ra_scale: float,
+    lst: float,
+    cooldown: dict[str, float],
+    now: float,
+) -> list[tuple[dict, float]]:
+    """Stars that just crossed: wait_d > 180 (past) and wait_d >= 360 - JUST_CROSSED_DEG (within ε of meridian).
+    Not on cooldown. Return (star, diff) sorted by diff asc (closest first).
+    """
+    cooldown_s = COOLDOWN_FRAC * SIDEREAL_DAY_S
+    lo = 360.0 - JUST_CROSSED_DEG  # e.g. 359.5: only 0–0.5° past
+    candidates: list[tuple[dict, float]] = []
+    for s in stars:
+        name = s.get("name") or ""
+        if name and (now - cooldown.get(name, -1e9)) < cooldown_s:
+            continue
+        ra = float(s["ra_deg"]) * ra_scale
+        wait_d = _wait_deg(lst, ra)
+        if wait_d <= 180.0 or wait_d < lo:
+            continue
+        diff = _diff_deg(lst, ra)
+        candidates.append((s, diff))
+    candidates.sort(key=lambda x: x[1])
+    return candidates
+
+
+def _upcoming(stars: list[dict], ra_scale: float, lst: float, lon_deg: float, now: float, n: int = 2):
+    """Next n stars to cross (smallest wait_d in 0..180). Return [(name, seconds)]."""
+    rate = _lst_rate_deg_per_sec(now, lon_deg)
+    cand: list[tuple[dict, float, float]] = []
+    for s in stars:
+        ra = float(s["ra_deg"]) * ra_scale
+        wait_d = _wait_deg(lst, ra)
+        if wait_d >= 180.0:
+            continue
+        sec = wait_d / rate
+        cand.append((s, wait_d, sec))
+    cand.sort(key=lambda x: x[1])
+    out = []
+    for s, _, sec in cand[:n]:
+        out.append((s.get("name") or "?", sec))
     return out
 
 
@@ -133,14 +230,10 @@ def run_scheduler(
     quiet: bool = False,
     stellarium_url: Optional[str] = None,
     note_duration: Optional[float] = None,
+    verbose: bool = False,
 ) -> None:
-    supplement: dict = {}
-    if supplement_path.is_file():
-        try:
-            supplement = json.loads(supplement_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pass
-
+    _log(f"loading catalog {catalog_path}", verbose)
+    _log(f"lon={lon_deg:.8f}° lat={lat_deg:.8f}° (full precision preserved)", verbose)
     raw = json.loads(catalog_path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise SystemExit("star_catalog.json must be a JSON array.")
@@ -155,105 +248,62 @@ def run_scheduler(
         and s.get("dec_deg") is not None
         and lo <= float(s["dec_deg"]) <= hi
     ]
+    _log(f"catalog: {len(raw)} total, {len(stars)} visible (dec {lo:.0f}°..{hi:.0f}°)", verbose)
 
     ras = [float(s["ra_deg"]) for s in stars]
     ra_scale = 15.0 if (ras and max(ras) <= 24.0) else 1.0
     if ra_scale != 1.0:
         print("Note: catalog ra_deg in hours; converting to degrees.\n", file=sys.stderr)
 
-    now = _unix()
-    tie = itertools.count()
-    heap: list[tuple[float, int, dict]] = []
-    for s in stars:
-        ra = float(s["ra_deg"]) * ra_scale
-        t = _next_transit_unix(ra, lon_deg, now, skip_immediate=False)
-        heapq.heappush(heap, (t, next(tie), s))
+    port = open_mido_output(midi_port_name, verbose=verbose)
+    cooldown: dict[str, float] = {}
+    last_upcoming = 0.0
 
-    port = open_mido_output(midi_port_name)
-
-    if not quiet and heap:
-        t0, _, s0 = heap[0]
-        d = max(0.0, t0 - _unix())
-        h, r = int(d) // 3600, int(d) % 3600
-        m, sec = r // 60, r % 60
-        ra0 = float(s0["ra_deg"]) * ra_scale
-        lst0 = _lst_deg(_time(now), lon_deg)
-        msg = f"Scheduled {len(stars)} stars. Next: {s0['name']} in {h}:{m:02d}:{sec:02d}\n"
-        if d > 1800:
-            msg += f"  LST≈{lst0/15:.1f}h  next star RA≈{ra0/15:.1f}h\n"
+    if not quiet:
+        lst, lon = _get_lst_and_lon(stellarium_url, lon_deg, verbose)
+        up = _upcoming(stars, ra_scale, lst, lon, _unix(), 2)
+        msg = f"Poll-based meridian trigger. {len(stars)} stars. LST≈{lst/15:.2f}h.\n"
+        if up:
+            msg += "  Next: " + ", ".join(f"{n} in {s:.0f}s" for n, s in up) + "\n"
         print(msg, flush=True)
 
     while True:
-        t_unix, _, star = heapq.heappop(heap)
-        ra = float(star["ra_deg"]) * ra_scale
-        rec = _star_rec(star, ra_scale, lat_deg)
-        dyads = star_to_dyads(rec, supplement)
+        now = _unix()
+        lst, lon = _get_lst_and_lon(stellarium_url, lon_deg, verbose)
+        just_crossed = _stars_just_crossed(stars, ra_scale, lst, cooldown, now)
 
-        # Wait until the star has *crossed* the meridian (LST > RA). We only fire/slew
-        # when we observe that crossing, not when we're still approaching.
-        skipped = False
-        waiting = False
-        while True:
-            u = _unix()
-            lst = _lst_deg(_time(u), lon_deg)
-            wait_d = _wait_deg(lst, ra)
+        if just_crossed:
+            star = just_crossed[0][0]
+            ra = float(star["ra_deg"]) * ra_scale
+            rec = _star_rec(star, ra_scale, lat_deg)
+            rec["lst_deg"] = lst
+            dyads = star_to_dyads(rec)
+            diff = just_crossed[0][1]
+            _log(f"fire {star['name']} just crossed lst={lst:.4f}° ra={ra:.4f}° |LST-RA|={diff:.4f}°", verbose)
 
-            if wait_d >= 180.0:
-                if not waiting:
-                    t_next = _next_transit_unix(ra, lon_deg, u, skip_immediate=True)
-                    heapq.heappush(heap, (t_next, next(tie), star))
-                    skipped = True
-                    break
-                if wait_d <= 180.0:
-                    t_next = _next_transit_unix(ra, lon_deg, u, skip_immediate=True)
-                    heapq.heappush(heap, (t_next, next(tie), star))
-                    skipped = True
-                    break
-                break
-            waiting = True
-
-            rate = _lst_rate_deg_per_sec(u, lon_deg)
-            wait_s = wait_d / rate
-            if wait_s > 600.0:
-                t_next = _next_transit_unix(ra, lon_deg, u, skip_immediate=True)
-                heapq.heappush(heap, (t_next, next(tie), star))
-                skipped = True
-                break
-
-            chunk = min(0.5, max(0.05, wait_s))
             if not quiet and sys.stdout.isatty():
-                print(viz.format_next(star["name"], wait_s), end="\r", flush=True)
-            time.sleep(chunk)
+                print(" " * 60, end="\r", flush=True)
+            if not quiet:
+                up = _upcoming(stars, ra_scale, lst, lon, now, 2)
+                viz.print_transit(rec, dyads, upcoming=up)
 
-        if skipped:
-            continue
-        if not quiet and sys.stdout.isatty():
-            print(" " * 60, end="\r", flush=True)
+            if stellarium_url:
+                cand = _stellarium_candidates(rec, star)
+                slew_to(
+                    rec["ra_deg"],
+                    rec["dec_deg"],
+                    base_url=stellarium_url,
+                    target_candidates=cand,
+                    verbose=verbose,
+                )
 
-        u_now = _unix()
-        lst_now = _lst_deg(_time(u_now), lon_deg)
-        rec["lst_deg"] = lst_now
-        diff_deg = _diff_deg(lst_now, ra)
-        if diff_deg > 1.0:
-            sys.stderr.write(
-                f"Transit skip: |LST−RA| = {diff_deg:.3f}° for {star['name']} — too far off meridian, rescheduling\n"
-            )
-            t_next = _next_transit_unix(ra, lon_deg, u_now, skip_immediate=True)
-            heapq.heappush(heap, (t_next, next(tie), star))
-            continue
-        if not quiet:
-            upcoming = [(s["name"], t - u_now) for t, _, s in heapq.nsmallest(50, heap) if t > u_now][:2]
-            viz.print_transit(rec, dyads, upcoming=upcoming)
+            send_dyads(port, dyads, note_duration=note_duration, verbose=verbose)
+            cooldown[star["name"]] = now
 
-        if stellarium_url:
-            slew_to(
-                rec["ra_deg"],
-                rec["dec_deg"],
-                base_url=stellarium_url,
-                target_candidates=_stellarium_candidates(rec, star),
-            )
+        elif not quiet and sys.stdout.isatty() and (now - last_upcoming >= 30.0 or last_upcoming == 0.0):
+            up = _upcoming(stars, ra_scale, lst, lon, now, 2)
+            if up:
+                print(viz.format_next(up[0][0], up[0][1]), end="\r", flush=True)
+            last_upcoming = now
 
-        send_dyads(port, dyads, note_duration=note_duration)
-
-        t_next = _next_transit_unix(ra, lon_deg, _unix() + SIDEREAL_DAY_S, skip_immediate=True)
-        heapq.heappush(heap, (t_next, next(tie), star))
+        time.sleep(POLL_INTERVAL_S)
