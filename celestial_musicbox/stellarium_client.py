@@ -26,6 +26,28 @@ def _get_status(base_url: str) -> dict | None:
         return None
 
 
+def get_object_info(base_url: str, object_name: str) -> dict | None:
+    """GET /api/objects/info?name=... returns object info including azimuth/altitude."""
+    url = f"{base_url.rstrip('/')}/api/objects/info"
+    try:
+        from urllib.parse import urlencode
+        req = request.Request(f"{url}?{urlencode({'name': object_name, 'format': 'json'})}", method="GET")
+        with request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except (URLError, OSError, json.JSONDecodeError):
+        return None
+
+
+def get_objects_batch_info(base_url: str, object_names: list[str]) -> dict[str, dict]:
+    """Query multiple objects and return their info. Returns dict of {name: info}."""
+    results = {}
+    for name in object_names:
+        info = get_object_info(base_url, name)
+        if info:
+            results[name] = info
+    return results
+
+
 def _set_fov(base_url: str, fov_deg: float) -> bool:
     """POST /api/main/fov with fov (degrees). Returns True if no HTTP error."""
     url = f"{base_url.rstrip('/')}/api/main/fov"

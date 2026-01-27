@@ -71,18 +71,29 @@ def main() -> None:
             print(n)
         return
 
+    stellarium_url = args.stellarium_url or ("http://localhost:8090" if args.stellarium else None)
+    
+    # If using Stellarium, --lon/--lat are optional (will be fetched from Stellarium)
+    # Otherwise they are required
     if args.lon is None or args.lat is None:
-        ap.error("--lon and --lat are required.")
+        if not stellarium_url:
+            ap.error("--lon and --lat are required (or use --stellarium to fetch location from Stellarium).")
+        # Use dummy values, will be overridden by Stellarium location
+        lon_deg = 0.0
+        lat_deg = 0.0
+    else:
+        lon_deg = args.lon
+        lat_deg = args.lat
+    
     if not args.catalog.is_file():
         ap.error(f"Catalog not found: {args.catalog}. Run: python scripts/build_star_catalog.py --lat <latitude>")
 
     midi_port = args.midi_port or os.environ.get("MIDI_PORT")
-    stellarium_url = args.stellarium_url or ("http://localhost:8090" if args.stellarium else None)
     run_scheduler(
         catalog_path=args.catalog,
         supplement_path=args.supplement,
-        lon_deg=args.lon,
-        lat_deg=args.lat,
+        lon_deg=lon_deg,
+        lat_deg=lat_deg,
         midi_port_name=midi_port,
         quiet=args.quiet,
         stellarium_url=stellarium_url,
