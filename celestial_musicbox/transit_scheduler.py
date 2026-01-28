@@ -143,9 +143,6 @@ def _get_lst_and_time(
                     try:
                         t = Time(float(jd), format="jd")
                         lst = _lst_deg(t, lon_deg)
-                        if verbose:
-                            print(f"[cmb] LST from Stellarium jd={jd} lon={lon_deg:.8f}° → lst={lst:.8f}°", 
-                                  file=sys.stderr, flush=True)
                         return (lst, lon_deg, t)
                     except (TypeError, ValueError):
                         pass
@@ -210,6 +207,84 @@ def _stellarium_candidates(rec: dict, star: dict) -> list[str]:
 def _log(msg: str, verbose: bool) -> None:
     if verbose:
         print(f"[cmb] {msg}", file=sys.stderr, flush=True)
+
+
+def _format_upcoming_stars(
+    stars: list[dict],
+    ra_scale: float,
+    lst_deg: float,
+    stellarium_url: Optional[str],
+    n: int = 5
+) -> str:
+    """Format a list of upcoming stars with their distance to meridian from Stellarium."""
+    # Find stars approaching meridian
+    candidates: list[tuple[str, float, float]] = []
+    
+    for s in stars:
+        name = s.get("name") or ""
+        if not name:
+            continue
+        ra_j2000_deg = float(s["ra_deg"]) * ra_scale
+        
+        # Quick check: is star approaching meridian? (within 5° ahead)
+        diff_j2000 = ra_j2000_deg - lst_deg
+        if diff_j2000 < 0:
+            diff_j2000 += 360.0
+        if diff_j2000 > 180.0:
+            diff_j2000 -= 360.0
+        
+        if 0 < diff_j2000 <= 5.0:
+            candidates.append((name, ra_j2000_deg, diff_j2000))
+    
+    if not candidates:
+        return ""
+    
+    # Sort by distance (closest first)
+    candidates.sort(key=lambda x: x[2])
+    
+    # Query Stellarium for accurate apparent RA of top candidates
+    lines = []
+    colors = ["\033[92m", "\033[93m", "\033[94m", "\033[95m", "\033[96m"]  # Green, yellow, blue, magenta, cyan
+    reset = "\033[0m"
+    bold = "\033[1m"
+    dim = "\033[2m"
+    
+    for i, (name, ra_j2000, _) in enumerate(candidates[:n]):
+        if stellarium_url:
+            # Find this star in the catalog to get identifiers
+            star = next((s for s in stars if s.get("name") == name), None)
+            if star:
+                cand_names = _stellarium_candidates({"name": name}, star)
+                if cand_names:
+                    obj_info = get_object_info(stellarium_url, cand_names[0])
+                    if obj_info:
+                        ra_apparent = obj_info.get("ra")
+                        if ra_apparent is not None:
+                            dist_to_meridian = float(ra_apparent) - lst_deg
+                            if dist_to_meridian < 0:
+                                dist_to_meridian += 360.0
+                            if dist_to_meridian > 180.0:
+                                dist_to_meridian -= 360.0
+                            
+                            color = colors[i % len(colors)]
+                            # Calculate time to meridian (degrees / rate)
+                            # LST advances at ~0.004178° per second
+                            lst_rate = 360.0 / 86164.0905  # degrees per second
+                            seconds_to_meridian = dist_to_meridian / lst_rate
+                            
+                            # Format time as MM:SS
+                            mins = int(seconds_to_meridian // 60)
+                            secs = int(seconds_to_meridian % 60)
+                            time_str = f"{mins:2d}m {secs:02d}s"
+                            
+                            lines.append(f"{color}{bold}{i+1}.{reset} {color}{name:20s}{reset} {dim}│{reset} {color}{dist_to_meridian:5.2f}°{reset} {dim}│{reset} {color}{time_str}{reset}")
+    
+    if lines:
+        header = f"\n{bold}\033[96m╔═══════════════════════════════════════════════════════════════╗{reset}"
+        title = f"{bold}\033[96m║{reset}  {bold}⏳ APPROACHING MERIDIAN{reset}                                  {bold}\033[96m║{reset}"
+        divider = f"{bold}\033[96m╚═══════════════════════════════════════════════════════════════╝{reset}"
+        return header + "\n" + title + "\n" + divider + "\n" + "\n".join(lines)
+    return ""
 
 
 def _stars_transiting_now(
@@ -457,10 +532,20 @@ def run_scheduler(
     if not quiet:
         lst, lon, current_time = _get_lst_and_time(stellarium_url, lon_deg, verbose)
         up = _upcoming(stars, ra_scale, lst, lon, _unix(), 2)
-        msg = f"Meridian transit trigger (LST = apparent RA). {len(stars)} stars. LST≈{lst/15:.2f}h.\n"
-        if up:
-            msg += "  Next: " + ", ".join(f"{n} in {s:.0f}s" for n, s in up) + "\n"
-        print(msg, flush=True)
+        
+        # L33t styled startup banner
+        cyan = "\033[96m"
+        green = "\033[92m"
+        yellow = "\033[93m"
+        bold = "\033[1m"
+        reset = "\033[0m"
+        
+        print(f"\n{bold}{cyan}╔═══════════════════════════════════════════════════════╗{reset}", flush=True)
+        print(f"{bold}{cyan}║{reset}  {bold}🎵 CELESTIAL MUSICBOX - MERIDIAN TRANSIT TRIGGER{reset}  {bold}{cyan}║{reset}", flush=True)
+        print(f"{bold}{cyan}╚═══════════════════════════════════════════════════════╝{reset}", flush=True)
+        print(f"{green}★{reset} Tracking {yellow}{len(stars)}{reset} stars crossing at Az=180°", flush=True)
+        print(f"{green}★{reset} LST: {yellow}{lst/15:.2f}h{reset} ({yellow}{lst:.2f}°{reset})", flush=True)
+        print(f"{green}★{reset} Location: {yellow}{lat_deg:.4f}°N{reset} {yellow}{lon_deg:.4f}°W{reset}\n", flush=True)
 
     # Main loop
     while True:
@@ -475,51 +560,57 @@ def run_scheduler(
             star, ra_j2000_deg, ra_apparent_deg, how_far_past = transiting[0]
             name = star.get("name", "")
             
-            # Log trigger with detailed info
-            print(f"\n[TRANSIT] {name}", file=sys.stderr, flush=True)
-            print(f"  LST         = {lst:.6f}° ({lst/15:.4f}h)", file=sys.stderr, flush=True)
-            print(f"  RA (J2000)  = {ra_j2000_deg:.6f}° ({ra_j2000_deg/15:.4f}h)", file=sys.stderr, flush=True)
-            print(f"  RA (apparent) = {ra_apparent_deg:.6f}° ({ra_apparent_deg/15:.4f}h)", file=sys.stderr, flush=True)
-            print(f"  Precession shift = {ra_apparent_deg - ra_j2000_deg:.6f}°", file=sys.stderr, flush=True)
-            status_text = f"{how_far_past:.6f}° ({abs(how_far_past)/(360.0/86164.0905):.1f}s {'past' if how_far_past >= 0 else 'before'} meridian)"
-            print(f"  LST - RA(apparent) = {'+' if how_far_past >= 0 else ''}{status_text}", 
-                  file=sys.stderr, flush=True)
+            # L33t trigger notification with colors
+            if not quiet:
+                status_text = f"{'past' if how_far_past >= 0 else 'before'}"
+                # Cyan for star name, magenta for numbers, bold for TRANSIT
+                cyan = "\033[96m"
+                magenta = "\033[95m"
+                bold = "\033[1m"
+                reset = "\033[0m"
+                print(f"\n🎵 {bold}[TRANSIT]{reset} {cyan}{name}{reset} │ {magenta}{abs(how_far_past):.3f}°{reset} {status_text} meridian", 
+                      file=sys.stderr, flush=True)
             
             # Build star record (use J2000 for catalog compatibility)
             rec = _star_rec(star, ra_scale, lat_deg)
             rec["lst_deg"] = lst
             dyads = star_to_dyads(rec)
             
-            # Display
+            # Display transit info box
             if not quiet:
                 if sys.stdout.isatty():
                     print(" " * 60, end="\r", flush=True)
                 up = _upcoming(stars, ra_scale, lst, lon, now, 2)
+                # Add apparent RA to the record for display
+                rec["ra_apparent_deg"] = ra_apparent_deg
                 viz.print_transit(rec, dyads, upcoming=up)
             
             # Slew Stellarium and verify azimuth
             if stellarium_url:
                 cand = _stellarium_candidates(rec, star)
                 
-                # Check azimuth BEFORE slewing and compare with Stellarium's RA
-                if cand:
+                # Check azimuth BEFORE slewing
+                if cand and not quiet:
                     obj_info = get_object_info(stellarium_url, cand[0])
                     if obj_info:
                         azimuth = obj_info.get("azimuth")
                         altitude = obj_info.get("altitude")
-                        st_ra = obj_info.get("raJ2000")  # Stellarium's J2000 RA
-                        st_ra_apparent = obj_info.get("ra")  # Stellarium's apparent RA
                         if azimuth is not None:
                             az_error = azimuth - 180.0
                             if az_error > 180:
                                 az_error -= 360
                             elif az_error < -180:
                                 az_error += 360
-                            print(f"  Stellarium: Az={azimuth:.4f}° (Δ={az_error:.4f}° from 180°) Alt={altitude:.2f}°", 
+                            # Color code based on accuracy
+                            if abs(az_error) < 0.1:
+                                color = "\033[92m"  # Green - excellent
+                            elif abs(az_error) < 0.3:
+                                color = "\033[93m"  # Yellow - good
+                            else:
+                                color = "\033[91m"  # Red - needs adjustment
+                            reset = "\033[0m"
+                            print(f"  {color}Stellarium: Az={azimuth:.2f}° (Δ={az_error:+.2f}°) Alt={altitude:.1f}°{reset}", 
                                   file=sys.stderr, flush=True)
-                            if st_ra is not None and st_ra_apparent is not None:
-                                print(f"  Stellarium RA: J2000={st_ra:.4f}° apparent={st_ra_apparent:.4f}° (catalog J2000={ra_j2000_deg:.4f}°)",
-                                      file=sys.stderr, flush=True)
                 
                 slew_to(
                     rec["ra_deg"],
@@ -536,19 +627,19 @@ def run_scheduler(
             cooldown[name] = now
 
         elif not quiet and sys.stdout.isatty():
-            # Show next upcoming transit
-            up = _upcoming(stars, ra_scale, lst, lon, now, 2)
-            if up and up[0][1] < 30:  # if next star is within 30 seconds
-                # Calculate current separation for next star
-                next_star_name = up[0][0]
-                for s in stars:
-                    if s.get("name") == next_star_name:
-                        next_ra = float(s["ra_deg"]) * ra_scale
-                        sep = _angular_separation(lst, next_ra)
-                        print(f"Next: {next_star_name} in {up[0][1]:.0f}s (LST={lst:.3f}° RA={next_ra:.3f}° Δ={sep:.3f}°)", 
-                              end="    \r", flush=True)
-                        break
-            elif up:
-                print(viz.format_next(up[0][0], up[0][1]), end="\r", flush=True)
+            # Show upcoming stars with their distance to meridian
+            # Update every 10 seconds to avoid too many Stellarium queries
+            import time
+            current_time_s = time.time()
+            if not hasattr(_format_upcoming_stars, '_last_update'):
+                _format_upcoming_stars._last_update = 0
+            
+            if current_time_s - _format_upcoming_stars._last_update >= 10:
+                upcoming_display = _format_upcoming_stars(stars, ra_scale, lst, stellarium_url, n=5)
+                if upcoming_display:
+                    # Clear previous output and show new list
+                    print("\033[2J\033[H", end="")  # Clear screen and move to top
+                    print(upcoming_display, flush=True)
+                _format_upcoming_stars._last_update = current_time_s
 
         time.sleep(POLL_INTERVAL_S)

@@ -83,27 +83,34 @@ def _shortest_arc_deg(a_deg: float, b_deg: float) -> float:
 
 def _coord_line(rec: dict) -> tuple[str, str]:
     """LST, RA, Dec for sanity checking. Returns (main_line, warning_or_empty).
-    At transit, LST and RA (in h) should match; if they differ by >1h, likely --lon or clock is wrong.
+    At transit, LST and apparent RA should match.
     """
-    ra = rec.get("ra_deg")
+    ra_j2000 = rec.get("ra_deg")
+    ra_apparent = rec.get("ra_apparent_deg")
     dec = rec.get("dec_deg")
     lst = rec.get("lst_deg")
     parts = []
     if lst is not None:
         parts.append(f"LST {float(lst)/15:.2f}h")
-    if ra is not None:
-        parts.append(f"RA {float(ra):.2f}\u00b0 ({float(ra)/15:.2f}h)")
+    
+    # Show apparent RA if available (this should match LST at transit)
+    if ra_apparent is not None:
+        parts.append(f"RA(now) {float(ra_apparent):.2f}\u00b0 ({float(ra_apparent)/15:.2f}h)")
+    elif ra_j2000 is not None:
+        parts.append(f"RA {float(ra_j2000):.2f}\u00b0 ({float(ra_j2000)/15:.2f}h)")
+    
     if dec is not None:
         parts.append(f"Dec {float(dec):+.2f}\u00b0")
     main = "  ".join(parts) if parts else ""
 
-    # Warn if RA and LST differ by >1h (15°) at transit — e.g. 12h bug from lon or clock
+    # Check if LST matches apparent RA
     warning = ""
-    if ra is not None and lst is not None:
-        short_deg = _shortest_arc_deg(ra, lst)
-        if short_deg > 15.0:
-            diff_h = short_deg / 15.0
-            warning = f"  \u2502  \u26a0 RA and LST differ by {diff_h:.1f}h \u2014 check --lon (East positive, e.g. -120 for 120\u00b0W) and system clock\n"
+    ra_to_check = ra_apparent if ra_apparent is not None else ra_j2000
+    if ra_to_check is not None and lst is not None:
+        short_deg = _shortest_arc_deg(ra_to_check, lst)
+        if short_deg > 1.0:  # More than 1° off
+            diff_deg = short_deg
+            warning = f"  \u2502  \u26a0 LST and RA differ by {diff_deg:.2f}\u00b0 \u2014 star not at meridian!\n"
     return main, warning
 
 
